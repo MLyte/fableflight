@@ -330,9 +330,21 @@ impl Graphics {
     pub fn display_ui(&mut self, ui: &mut egui::Ui, window: (u32, u32), fps: f64) {
         row(ui, "Render resolution", "below 100% upscales, above supersamples", |ui| {
             let (w, h) = window;
-            let (rw, rh) = ((w as f32 * self.scale).round() as u32, (h as f32 * self.scale).round() as u32);
-            ui.add(egui::Slider::new(&mut self.scale, SCALE_MIN..=SCALE_MAX).step_by(0.05).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-            let what = if self.scale > 1.001 { "supersampled" } else if self.scale < 0.999 { "upscaled" } else { "native" };
+            // Preview the size while dragging. Rebuild the render textures
+            // once on release, or immediately for a keyboard edit.
+            let id = ui.scope_id().with("scale_drag");
+            let mut scale = ui.data(|m| m.get_temp(id)).unwrap_or(self.scale);
+            let response = ui.add(egui::Slider::new(&mut scale, SCALE_MIN..=SCALE_MAX).step_by(0.05).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+            if response.dragged() {
+                ui.data_mut(|m| m.insert_temp(id, scale));
+            } else {
+                ui.data_mut(|m| m.remove::<f32>(id));
+                if response.changed() || response.drag_stopped() {
+                    self.scale = scale;
+                }
+            }
+            let (rw, rh) = ((w as f32 * scale).round() as u32, (h as f32 * scale).round() as u32);
+            let what = if scale > 1.001 { "supersampled" } else if scale < 0.999 { "upscaled" } else { "native" };
             ui.label(RichText::new(format!("{rw}×{rh}, {what}")).font(menu::caption()).color(DIM));
         });
         row(ui, "Anti-aliasing", "temporal (TAA) · F2 in flight", |ui| {

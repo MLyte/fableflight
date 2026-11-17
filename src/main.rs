@@ -5424,12 +5424,22 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
 
     /// Hands changed graphics settings to the renderer and the world.
     fn apply_graphics(&mut self) {
-        let g = self.gfx;
+        let mut g = self.gfx;
         if self.gfx_applied == Some(g) {
             return;
         }
-        self.r.set_scale(g.scale);
-        self.r.set_shadow_res(g.shadow_res());
+        let requested_scale = g.scale;
+        g.scale = self.r.set_scale(g.scale);
+        let shadows_ok = self.r.set_shadow_res(g.shadow_res());
+        if !shadows_ok {
+            g.shadows = self.gfx_applied.unwrap_or_default().shadows;
+        }
+        if requested_scale != g.scale || !shadows_ok {
+            log::warn!("graphics memory limit: kept render scale {} and shadow size {}", g.scale, self.r.shadow_res());
+            self.status = t!("Graphics memory limit reached. Previous quality kept for the affected setting.", "Mémoire graphique insuffisante. Le réglage concerné conserve sa valeur précédente.").into();
+            self.status_until = self.real + 8.0;
+        }
+        self.gfx = g;
         self.r.set_vsync(g.vsync);
         self.r.ao = g.ao;
         self.r.cloud_step = g.cloud_step();
@@ -5440,6 +5450,7 @@ status, status_until: 8.0, shots: args.shots.clone(), crash_at: args.crash_at, b
         self.world.tree_imp_k = g.tree_imp_k();
         self.world.cars = g.car_density();
         if self.gfx_applied.is_some() {
+            g.save();
             log::info!("graphics: {} at {:.0}%, shadows {}, clouds {}, terrain {}, scenery {}, city {}, trees {}, traffic {}, AO {}", g.matches().map(graphics::Level::name).unwrap_or("custom"), g.scale * 100.0, g.shadows.name(), g.clouds.name(), g.terrain.name(), g.scenery.name(), g.city.name(), g.trees.name(), g.cars.name(), g.ao);
         }
         self.gfx_applied = Some(g);

@@ -1056,6 +1056,25 @@ pub(crate) fn buf_res(binding: u32, b: &wgpu::Buffer, size: u64) -> wgpu::BindGr
     wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: b, offset: 0, size: wgpu::BufferSize::new(size) }) }
 }
 
+/// A rejected graphics option must leave the current frame resources usable.
+fn try_graphics_allocation<T>(device: &wgpu::Device, create: impl FnOnce() -> T) -> Option<T> {
+    // Release resources retired by previous frames before attempting the swap.
+    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    // Creating a view or bind group from a failed allocation can also report
+    // validation errors. Surface those unless the originating error was OOM.
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let new = create();
+    let invalid = pollster::block_on(validation.pop());
+    if pollster::block_on(oom.pop()).is_some() {
+        return None;
+    }
+    if let Some(error) = invalid {
+        panic!("invalid graphics resources: {error}");
+    }
+    Some(new)
+}
+
 /// The sun's shadow map: one layer per cascade and one for the aircraft, as
 /// an array (for lookups) and one view per layer (to draw into).
 fn make_shadow(d: &wgpu::Device, res: u32) -> (wgpu::TextureView, Vec<wgpu::TextureView>) {
@@ -2308,25 +2327,36 @@ impl Renderer {
         if self.integrated { self.shadow_res / PLANE_SHADOW_DIV_INTEGRATED } else { self.shadow_res }
     }
 
-    fn remake_targets(&mut self) {
+    fn replacement_targets(&self) -> (Targets, crate::fluid::FluidTargets) {
+        let (w, h) = self.render_size();
+        let targets = Self::make_targets(&self.device, &self.config, (w, h), &self.l_dres, &self.l_ao, &self.l_composite, &self.l_cloud, &self.l_cloud_apply, &self.l_cloud_temporal, &self.l_post, &self.l_pdraw, &self.l_glass, &self.psim_ub, &self.pbuf, &self.black);
+        let fluid = self.fluid.draw_targets(&self.device, &targets.depth, w, h);
+        (targets, fluid)
+    }
+
+    fn install_targets(&mut self, pair: (Targets, crate::fluid::FluidTargets)) {
+        (self.targets, self.fluid_t) = pair;
         self.cloud_hist_ok = false;
         self.taa_hist_ok = false;
         self.logo_key = None;
-        let (w, h) = self.render_size();
-        self.targets = Self::make_targets(&self.device, &self.config, (w, h), &self.l_dres, &self.l_ao, &self.l_composite, &self.l_cloud, &self.l_cloud_apply, &self.l_cloud_temporal, &self.l_post, &self.l_pdraw, &self.l_glass, &self.psim_ub, &self.pbuf, &self.black);
-        self.fluid_t = self.fluid.draw_targets(&self.device, &self.targets.depth, w, h);
     }
 
-    /// Render resolution as a share of the window's (graphics settings).
-    pub fn set_scale(&mut self, s: f32) {
-        let s = s.clamp(crate::graphics::SCALE_MIN, crate::graphics::SCALE_MAX);
-        if s != self.scale {
-            let old = self.render_size();
-            self.scale = s;
-            if self.render_size() != old {
-                self.remake_targets();
+    fn remake_targets(&mut self) {
+        self.install_targets(self.replacement_targets());
+    }
+
+    /// Returns the scale actually accepted by the device.
+    pub fn set_scale(&mut self, s: f32) -> f32 {
+        let previous = self.scale;
+        let size = self.render_size();
+        self.scale = s.clamp(crate::graphics::SCALE_MIN, crate::graphics::SCALE_MAX);
+        if self.render_size() != size {
+            match try_graphics_allocation(&self.device, || self.replacement_targets()) {
+                Some(pair) => self.install_targets(pair),
+                None => self.scale = previous,
             }
         }
+        self.scale
     }
 
     pub fn shadow_res(&self) -> u32 {
@@ -2334,14 +2364,18 @@ impl Renderer {
     }
 
     /// A new sun shadow map of this side (texels).
-    pub fn set_shadow_res(&mut self, res: u32) {
+    pub fn set_shadow_res(&mut self, res: u32) -> bool {
         let res = res.clamp(256, self.device.limits().max_texture_dimension_2d);
         if res != self.shadow_res {
-            let (all, layers) = make_shadow(&self.device, res);
-            self.bg0 = self.bg0_src.make(&self.device, &all);
+            let Some((bg, layers)) = try_graphics_allocation(&self.device, || {
+                let (all, layers) = make_shadow(&self.device, res);
+                (self.bg0_src.make(&self.device, &all), layers)
+            }) else { return false };
+            self.bg0 = bg;
             self.shadow = layers;
             self.shadow_res = res;
         }
+        true
     }
 
     pub fn set_vsync(&mut self, on: bool) {

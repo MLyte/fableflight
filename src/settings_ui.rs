@@ -374,16 +374,12 @@ impl Game {
     }
 
     fn set_graphics(&mut self, ui: &mut Ui) {
-        let before = self.gfx;
         let size = self.window.inner_size();
         card(ui, t!("Preset", "Préréglage"), |ui| self.gfx.preset_ui(ui));
         card(ui, t!("Quality", "Qualité"), |ui| self.gfx.quality_ui(ui));
         card(ui, t!("Display", "Affichage"), |ui| self.gfx.display_ui(ui, (size.width, size.height), self.fps));
         let on = if self.src.google.photoreal() { t!("on", "activées") } else { t!("off", "désactivées") };
         note(ui, &t!("Google's photorealistic 3D cities ({}) have their own switch and detail level under Map and data.", "Les villes 3D photoréalistes de Google ({}) ont leur propre réglage dans Carte et données.", on));
-        if self.gfx != before {
-            self.gfx.save();
-        }
     }
 
     fn set_sound(&mut self, ui: &mut Ui) {

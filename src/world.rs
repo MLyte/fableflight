@@ -37,6 +37,7 @@ enum Slot {
     Failed,
 }
 struct BTile {
+    gpu_bytes: usize,
     center: DVec3,
     radius: f64,
     gpu: Option<BuildGpu>,
@@ -77,10 +78,12 @@ enum FSlot {
 }
 enum BSlot {
     Loading,
+    Deferred { camera: DVec3, frame: u64 },
     Ready(Box<BTile>),
 }
 /// A building tile whose geometry is still being copied to the GPU.
 struct Upload {
+    gpu_bytes: usize,
     id: TileId,
     data: Box<buildings::BuildingData>,
     gpu: BuildGpu,
@@ -95,6 +98,12 @@ struct Upload {
 const UPLOAD_BUDGET: usize = 24 << 20;
 /// Largest single write into a building buffer.
 const UPLOAD_CHUNK: usize = 8 << 20;
+/// Dense city meshes can occupy hundreds of MiB each. Keep the slot until
+/// the last GPU upload finishes, including time spent waiting in either queue.
+const MAX_LOADING_BUILDINGS: usize = 2;
+
+/// Budget for resident OSM geometry and atlases, including unfinished uploads.
+const BUILDING_GPU_BUDGET: usize = 768 << 20;
 
 pub struct Ground {
     pub h: f64,
@@ -926,9 +935,15 @@ impl World {
                     match res {
                         Ok(bd) => {
                             // The slot stays Loading until the geometry is all on the GPU.
-                            bytes += bd.atlas.iter().map(|m| m.len()).sum::<usize>();
+                            let atlas_bytes = bd.atlas.iter().map(Vec::len).sum::<usize>();
+                            let gpu_bytes = atlas_bytes + crate::render::building_payload(&bd).iter().map(|data| data.len().max(64)).sum::<usize>();
+                            if !self.make_building_room(cam, bd.center, gpu_bytes) {
+                                self.builds.insert(id, BSlot::Deferred { camera: cam, frame: self.frame });
+                                continue;
+                            }
+                            bytes += atlas_bytes;
                             let gpu = r.upload_buildings(&bd);
-                            self.uploads.push_back(Upload { id, data: Box::new(bd), gpu, part: 0, off: 0 });
+                            self.uploads.push_back(Upload { gpu_bytes, id, data: Box::new(bd), gpu, part: 0, off: 0 });
                         }
                         Err(_) => {
                             self.builds.remove(&id);
@@ -1007,7 +1022,8 @@ impl World {
                                 self.in_view.push(fr.sphere(b.center - cam, b.radius));
                             }
                         }
-                        Some(BSlot::Loading) => {}
+                        Some(BSlot::Deferred { camera, .. }) if camera.distance(cam) > w * 0.5 => self.wanted.push((0.8 + (d / w) as f32 * 0.6, id.with_tag())),
+                        Some(BSlot::Deferred { .. } | BSlot::Loading) => {}
                         None => self.wanted.push((0.8 + (d / w) as f32 * 0.6, id.with_tag())),
                     }
                 }
@@ -1043,11 +1059,21 @@ impl World {
         // (What is not asked for this time stays in `wanted` until the next
         // update clears it: `queued` counts it.)
         let mut sent = 0;
+        let mut loading_buildings = self.builds.values().filter(|s| matches!(s, BSlot::Loading)).count();
         for k in 0..self.wanted.len() {
             if self.in_flight >= 28 {
                 break;
             }
             let (prio, id) = self.wanted[k];
+            if id.z & 0x80 != 0 {
+                if loading_buildings >= MAX_LOADING_BUILDINGS {
+                    continue;
+                }
+                loading_buildings += 1;
+            }
+            // Keep deferred city requests in the queue count while allowing
+            // lower-priority terrain work to use the remaining workers.
+            self.wanted.swap(sent, k);
             sent += 1;
             self.in_flight += 1;
             if id.z & 0x80 != 0 {
@@ -1079,7 +1105,11 @@ impl World {
                 self.tiles.retain(|id, s| id.z <= 3 || !matches!(s, Slot::Ready(t) if f - t.last_used > 600));
             }
             self.tiles.retain(|_, s| !matches!(s, Slot::Failed) || f % 3600 != 0);
-            self.builds.retain(|_, s| !matches!(s, BSlot::Ready(b) if f - b.last_used > 900));
+            self.builds.retain(|_, s| match s {
+                BSlot::Ready(b) => f - b.last_used <= 900 && b.center.distance(cam) < 25_000.0,
+                BSlot::Deferred { frame, .. } => f - *frame < 1800,
+                BSlot::Loading => true,
+            });
             self.fields.retain(|_, s| match s {
                 FSlot::Ready(fl) => f - fl.last_used < 1200,
                 FSlot::Failed => f % 3600 != 0,
@@ -1087,6 +1117,38 @@ impl World {
             });
         }
         self.stats = (self.draw.len(), self.in_flight, self.draw_b.len());
+    }
+
+    /// Prefer nearby tiles when a dense city exceeds the geometry budget.
+    /// The distance margin avoids rebuilding neighbours as the camera turns.
+    fn make_building_room(&mut self, cam: DVec3, center: DVec3, bytes: usize) -> bool {
+        let mut used = bytes + self.uploads.iter().map(|u| u.gpu_bytes).sum::<usize>();
+        let mut farther = Vec::new();
+        let cutoff = center.distance_squared(cam) * 1.21;
+        for (&id, slot) in &self.builds {
+            if let BSlot::Ready(b) = slot {
+                used += b.gpu_bytes;
+                let distance = b.center.distance_squared(cam);
+                if distance > cutoff {
+                    farther.push((distance, id, b.gpu_bytes));
+                }
+            }
+        }
+        if used <= BUILDING_GPU_BUDGET {
+            return true;
+        }
+        if used - farther.iter().map(|item| item.2).sum::<usize>() > BUILDING_GPU_BUDGET {
+            return false;
+        }
+        farther.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, id, size) in farther {
+            self.builds.insert(id, BSlot::Deferred { camera: cam, frame: self.frame });
+            used -= size;
+            if used <= BUILDING_GPU_BUDGET {
+                break;
+            }
+        }
+        true
     }
 
     /// Copy queued building geometry to the GPU until `bytes` (already used
@@ -1115,12 +1177,12 @@ impl World {
             if u.part < payload.len() {
                 break;
             }
-            let Upload { id, data, gpu, .. } = self.uploads.pop_front().unwrap();
+            let Upload { gpu_bytes, id, data, gpu, .. } = self.uploads.pop_front().unwrap();
             let bd = *data;
             let main = bd.cls[0];
             let tall = (0..buildings::HCLASS.len()).find(|&c| main[c] > if c == 0 { 0 } else { main[c - 1] }).map_or(1.0, |c| buildings::HCLASS[c].1);
             let cars = cars::spawn(&bd.net, id.x.wrapping_mul(2246822519) ^ id.y.wrapping_mul(3266489917));
-            self.builds.insert(id, BSlot::Ready(Box::new(BTile { center: bd.center, radius: bd.radius, gpu: Some(gpu), footprints: bd.footprints, last_used: self.frame, net: bd.net, cars, parked: bd.parked, trees: bd.trees, tree_var: bd.tree_var, chunks: bd.chunks, under: bd.under, cells: bd.cells, near_idx: bd.near_idx, ax: bd.ax, ay: bd.ay, shown: 0.0, mid_t: 0.0, fine_t: 0.0, tall })));
+            self.builds.insert(id, BSlot::Ready(Box::new(BTile { gpu_bytes, center: bd.center, radius: bd.radius, gpu: Some(gpu), footprints: bd.footprints, last_used: self.frame, net: bd.net, cars, parked: bd.parked, trees: bd.trees, tree_var: bd.tree_var, chunks: bd.chunks, under: bd.under, cells: bd.cells, near_idx: bd.near_idx, ax: bd.ax, ay: bd.ay, shown: 0.0, mid_t: 0.0, fine_t: 0.0, tall })));
         }
         bytes
     }
